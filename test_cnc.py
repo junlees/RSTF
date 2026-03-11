@@ -7,6 +7,8 @@ to the classification probability instead of LSTM output.
 Usage:
     python test_cnc.py -r saved/models/CNC_TransformerAutoencoder/XXXX/model_best.pth
     python test_cnc.py -r <checkpoint> -c config_cnc_transformer.json
+    python test_cnc.py -r <checkpoint> --epsilon 0.05 --plot
+    python test_cnc.py -r <checkpoint> --plot --plot-dir results/figures
 """
 
 import argparse
@@ -71,14 +73,233 @@ def rough_set_decision(prob_anomaly: np.ndarray, epsilon: float = 0.1):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Visualization helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_intervals(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Convert boolean mask to list of (start, end) index intervals."""
+    intervals = []
+    in_interval = False
+    start = 0
+    for i, v in enumerate(mask):
+        if v and not in_interval:
+            start = i
+            in_interval = True
+        elif not v and in_interval:
+            intervals.append((start, i))
+            in_interval = False
+    if in_interval:
+        intervals.append((start, len(mask)))
+    return intervals
+
+
+def save_reconstruction_plot(
+    all_inputs: np.ndarray,       # (N, W, F) — z-scored window data
+    all_recon_errors: np.ndarray, # (N,)       — per-window MSE
+    all_probs: np.ndarray,        # (N,)       — P(anomaly)
+    all_labels: np.ndarray,       # (N,)       — ground-truth labels
+    regions: np.ndarray,          # (N,)       — 'upper'|'lower'|'boundary'
+    epsilon: float,
+    stride: int,
+    save_path: Path,
+    max_windows: int = 5000,
+) -> None:
+    """
+    Save a multi-panel figure showing:
+      • Original time series (3 channels) coloured by per-step reconstruction error
+      • RST boundary-region intervals shaded in orange
+      • Ground-truth label strip (thin coloured bar)
+      • Probability panel with ε thresholds
+
+    Windows are mapped back to a continuous time axis using the given stride.
+    When N > max_windows the sequence is uniformly subsampled before plotting.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    from matplotlib.collections import LineCollection
+    from matplotlib.patches import Patch
+
+    N, W, F = all_inputs.shape
+    ch_names = ["X-axis", "Y-axis", "Z-axis"][:F]
+
+    # ── optional subsampling ─────────────────────────────────────────────
+    if N > max_windows:
+        idx = np.linspace(0, N - 1, max_windows, dtype=int)
+        all_inputs       = all_inputs[idx]
+        all_recon_errors = all_recon_errors[idx]
+        all_probs        = all_probs[idx]
+        all_labels       = all_labels[idx]
+        regions          = regions[idx]
+        N = max_windows
+
+    # ── reconstruct continuous signal from overlapping windows ───────────
+    T = (N - 1) * stride + W
+
+    signal    = np.zeros((T, F), dtype=np.float32)
+    error_map = np.zeros(T, dtype=np.float64)   # averaged reconstruction MSE
+    prob_map  = np.zeros(T, dtype=np.float64)   # averaged P(anomaly)
+    count_map = np.zeros(T, dtype=np.int32)
+
+    for i in range(N):
+        s, e = i * stride, i * stride + W
+        signal[s:e]    += all_inputs[i]
+        error_map[s:e] += all_recon_errors[i]
+        prob_map[s:e]  += all_probs[i]
+        count_map[s:e] += 1
+
+    valid = count_map > 0
+    signal[valid]    /= count_map[valid, None]
+    error_map[valid] /= count_map[valid]
+    prob_map[valid]  /= count_map[valid]
+
+    # ── per-timestep RST region (majority vote over overlapping windows) ─
+    region_votes = {"upper": np.zeros(T), "lower": np.zeros(T), "boundary": np.zeros(T)}
+    for i in range(N):
+        s, e = i * stride, i * stride + W
+        region_votes[regions[i]][s:e] += 1
+
+    region_stack = np.stack([region_votes["upper"],
+                              region_votes["lower"],
+                              region_votes["boundary"]], axis=1)
+    region_idx   = region_stack.argmax(axis=1)          # 0=upper,1=lower,2=boundary
+    ts_boundary  = region_idx == 2                       # boolean mask
+
+    # ── per-timestep ground-truth label strip (window centre → timestep) ─
+    label_strip = np.full(T, -1, dtype=int)
+    for i in range(N):
+        centre = i * stride + W // 2
+        if centre < T:
+            label_strip[centre] = all_labels[i]
+    # forward-fill gaps
+    last = -1
+    for t in range(T):
+        if label_strip[t] >= 0:
+            last = label_strip[t]
+        elif last >= 0:
+            label_strip[t] = last
+
+    t = np.arange(T)
+
+    # ── colour normalisation (shared across channels) ────────────────────
+    err_min, err_max = error_map.min(), error_map.max()
+    if err_max - err_min < 1e-12:           # flat error — avoid div-by-zero
+        err_max = err_min + 1e-6
+    norm = mcolors.Normalize(vmin=err_min, vmax=err_max)
+    cmap = plt.cm.RdYlGn_r                  # red = high error, green = low
+
+    boundary_color = "#FF8C00"              # dark-orange
+    label_colors   = {0: "#EF5350", 1: "#42A5F5", -1: "#BDBDBD"}
+
+    # ── layout: F signal panels + 1 probability panel ────────────────────
+    n_rows   = F + 1
+    row_h    = [3.0] * F + [2.5]
+    fig, axes = plt.subplots(
+        n_rows, 1,
+        figsize=(20, sum(row_h) + 1.0),
+        gridspec_kw={"height_ratios": row_h},
+        sharex=True,
+    )
+
+    # ─── signal panels ────────────────────────────────────────────────────
+    for f_idx in range(F):
+        ax = axes[f_idx]
+        y  = signal[:, f_idx]
+
+        # Colored line via LineCollection
+        pts  = np.stack([t, y], axis=1).reshape(-1, 1, 2)
+        segs = np.concatenate([pts[:-1], pts[1:]], axis=1)  # (T-1, 2, 2)
+        lc   = LineCollection(segs, cmap=cmap, norm=norm, linewidth=1.0, alpha=0.9)
+        lc.set_array(error_map[:-1])
+        ax.add_collection(lc)
+
+        # RST boundary shading
+        for s_t, e_t in _get_intervals(ts_boundary):
+            ax.axvspan(s_t, e_t, color=boundary_color, alpha=0.18, linewidth=0)
+
+        # Ground-truth label strip (very thin bar at the bottom of the axes)
+        strip_y_min = y.min() - 0.8
+        strip_y_max = strip_y_min + 0.25
+        for lval, lcolor in [(0, label_colors[0]), (1, label_colors[1])]:
+            mask = label_strip == lval
+            for s_t, e_t in _get_intervals(mask):
+                ax.fill_between(
+                    [s_t, e_t], strip_y_min, strip_y_max,
+                    color=lcolor, alpha=0.6, linewidth=0,
+                )
+
+        ax.set_xlim(0, T - 1)
+        ax.set_ylim(strip_y_min - 0.1, y.max() + 0.5)
+        ax.set_ylabel(ch_names[f_idx], fontsize=10)
+        ax.set_title(f"Channel {ch_names[f_idx]}  —  coloured by reconstruction error",
+                     fontsize=10, pad=4)
+
+        # Colorbar
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cb = fig.colorbar(sm, ax=ax, fraction=0.015, pad=0.01)
+        cb.set_label("Recon. MSE", fontsize=8)
+        cb.ax.tick_params(labelsize=7)
+
+    # ─── probability panel ────────────────────────────────────────────────
+    ax_p = axes[F]
+    ax_p.plot(t, prob_map, color="steelblue", linewidth=0.9, label="P(anomaly)", zorder=3)
+
+    upper_th = 0.5 + epsilon
+    lower_th = 0.5 - epsilon
+    ax_p.axhline(upper_th, color="#D32F2F", linestyle="--", linewidth=1.0,
+                 label=f"upper  {upper_th:.2f}")
+    ax_p.axhline(lower_th, color="#388E3C", linestyle="--", linewidth=1.0,
+                 label=f"lower  {lower_th:.2f}")
+    ax_p.axhspan(lower_th, upper_th, color=boundary_color, alpha=0.12, linewidth=0,
+                 label=f"boundary zone  (ε={epsilon})")
+
+    # RST boundary shading in probability panel too
+    for s_t, e_t in _get_intervals(ts_boundary):
+        ax_p.axvspan(s_t, e_t, color=boundary_color, alpha=0.22, linewidth=0)
+
+    ax_p.set_xlim(0, T - 1)
+    ax_p.set_ylim(-0.05, 1.05)
+    ax_p.set_ylabel("P(anomaly)", fontsize=10)
+    ax_p.set_xlabel("Time step (sample)", fontsize=10)
+    ax_p.set_title("Classification probability with RST boundary region", fontsize=10, pad=4)
+    ax_p.legend(loc="upper right", fontsize=8, framealpha=0.8)
+
+    # ─── shared legend for ground-truth strip + boundary ─────────────────
+    legend_handles = [
+        Patch(facecolor=label_colors[0], alpha=0.6, label="GT: NOK (anomaly)"),
+        Patch(facecolor=label_colors[1], alpha=0.6, label="GT: OK  (normal)"),
+        Patch(facecolor=boundary_color,  alpha=0.4, label=f"RST boundary region (ε={epsilon})"),
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=3,
+               fontsize=8, framealpha=0.8, bbox_to_anchor=(0.5, 0.0))
+
+    fig.suptitle(
+        "CNC Anomaly Detection — Reconstruction Error & RST Boundary Analysis",
+        fontsize=13, y=1.01,
+    )
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [plot] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate(config, checkpoint_path, epsilon: float = 0.1):
+def evaluate(
+    config,
+    checkpoint_path,
+    epsilon: float = 0.1,
+    plot: bool = False,
+    plot_dir: Path | None = None,
+    plot_max_windows: int = 5000,
+):
     logger = config.get_logger("test")
 
     # ── Data ─────────────────────────────────────────────────────────────
-    # Use test split (no shuffling, no augmentation, full dataset)
     data_loader_args = config["data_loader"]["args"].copy()
     data_loader_args.update({
         "batch_size"       : 256,
@@ -88,6 +309,10 @@ def evaluate(config, checkpoint_path, epsilon: float = 0.1):
     })
     from data_loader.cnc_data_loaders import CNCDataLoader
     data_loader = CNCDataLoader(**data_loader_args)
+
+    stride = (
+        data_loader_args["window_size"] - data_loader_args.get("overlap", 25)
+    )
 
     # ── Model ────────────────────────────────────────────────────────────
     model = config.init_obj("arch", module_arch)
@@ -103,10 +328,13 @@ def evaluate(config, checkpoint_path, epsilon: float = 0.1):
     model.eval()
 
     # ── Inference ────────────────────────────────────────────────────────
-    all_probs    = []
-    all_labels   = []
-    total_recon  = 0.0
-    n_samples    = 0
+    all_probs         = []
+    all_labels        = []
+    all_recon_errors  = []
+    all_inputs_list   = [] if plot else None   # only collect when needed
+
+    total_recon = 0.0
+    n_samples   = 0
 
     with torch.no_grad():
         for data, target in tqdm(data_loader, desc="Evaluating"):
@@ -117,13 +345,18 @@ def evaluate(config, checkpoint_path, epsilon: float = 0.1):
             all_probs.extend(probs.tolist())
             all_labels.extend(target.numpy().tolist())
 
-            # Reconstruction error per sample
+            # Per-sample reconstruction MSE  — (B,)
             recon_mse = ((reconstruction.cpu() - data.cpu()) ** 2).mean(dim=(1, 2))
+            all_recon_errors.extend(recon_mse.numpy().tolist())
             total_recon += recon_mse.sum().item()
             n_samples   += len(data)
 
-    all_probs  = np.array(all_probs)
-    all_labels = np.array(all_labels)
+            if plot:
+                all_inputs_list.append(data.cpu().numpy())
+
+    all_probs        = np.array(all_probs)
+    all_labels       = np.array(all_labels)
+    all_recon_errors = np.array(all_recon_errors)
 
     # ── Rough-Set post-processing ─────────────────────────────────────────
     predictions, uncertainty, regions = rough_set_decision(all_probs, epsilon)
@@ -142,7 +375,7 @@ def evaluate(config, checkpoint_path, epsilon: float = 0.1):
     avg_recon   = total_recon / n_samples
 
     # Boundary region stats
-    n_boundary  = np.sum(regions == "boundary")
+    n_boundary   = np.sum(regions == "boundary")
     pct_boundary = 100.0 * n_boundary / len(all_labels)
 
     results = {
@@ -172,6 +405,31 @@ def evaluate(config, checkpoint_path, epsilon: float = 0.1):
                 f"({pct_boundary:.1f}%) samples (ε={epsilon})")
     logger.info("=" * 50)
 
+    # ── Visualization ─────────────────────────────────────────────────────
+    if plot:
+        all_inputs = np.concatenate(all_inputs_list, axis=0)  # (N, W, F)
+
+        if plot_dir is None:
+            plot_dir = Path(checkpoint_path).parent
+        else:
+            plot_dir = Path(plot_dir)
+        plot_dir.mkdir(parents=True, exist_ok=True)
+
+        ckpt_stem = Path(checkpoint_path).stem
+        save_path = plot_dir / f"{ckpt_stem}_recon_rst_eps{epsilon:.3f}.png"
+
+        save_reconstruction_plot(
+            all_inputs       = all_inputs,
+            all_recon_errors = all_recon_errors,
+            all_probs        = all_probs,
+            all_labels       = all_labels,
+            regions          = regions,
+            epsilon          = epsilon,
+            stride           = stride,
+            save_path        = save_path,
+            max_windows      = plot_max_windows,
+        )
+
     return results
 
 
@@ -180,13 +438,28 @@ def evaluate(config, checkpoint_path, epsilon: float = 0.1):
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    args = argparse.ArgumentParser(description="CNC Transformer Autoencoder — Test")
-    args.add_argument("-c", "--config", default=None, type=str)
-    args.add_argument("-r", "--resume", required=True,  type=str,
-                      help="path to model checkpoint")
-    args.add_argument("-d", "--device", default=None,   type=str)
-    args.add_argument("--epsilon",      default=0.1,    type=float,
-                      help="Rough Set uncertainty threshold ε  (default: 0.1)")
+    parser = argparse.ArgumentParser(description="CNC Transformer Autoencoder — Test")
+    parser.add_argument("-c", "--config", default=None, type=str)
+    parser.add_argument("-r", "--resume", required=True,  type=str,
+                        help="path to model checkpoint")
+    parser.add_argument("-d", "--device", default=None,   type=str)
+    parser.add_argument("--epsilon",      default=0.1,    type=float,
+                        help="Rough Set uncertainty threshold ε  (default: 0.1)")
+    parser.add_argument("--plot",         action="store_true",
+                        help="save reconstruction-error + RST boundary figure")
+    parser.add_argument("--plot-dir",     default=None,   type=str,
+                        help="directory to save figures (default: alongside checkpoint)")
+    parser.add_argument("--plot-max-windows", default=5000, type=int,
+                        help="max windows to plot (uniformly subsampled, default: 5000)")
 
-    config = ConfigParser.from_args(args)
-    results = evaluate(config, config.resume, epsilon=0.1)
+    parsed = parser.parse_args()
+    config  = ConfigParser.from_args(parser)
+
+    evaluate(
+        config,
+        config.resume,
+        epsilon          = parsed.epsilon,
+        plot             = parsed.plot,
+        plot_dir         = parsed.plot_dir,
+        plot_max_windows = parsed.plot_max_windows,
+    )
