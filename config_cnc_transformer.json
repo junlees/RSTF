@@ -1,0 +1,80 @@
+{
+    "name": "CNC_TransformerAutoencoder",
+    "n_gpu": 1,
+
+    "arch": {
+        "type": "TransformerAnomalyDetector",
+        "args": {
+            "n_features"         : 3,
+            "window_size"        : 50,
+            "d_model"            : 64,
+            "nhead"              : 4,
+            "num_encoder_layers" : 3,
+            "num_decoder_layers" : 3,
+            "dim_feedforward"    : 256,
+            "dropout"            : 0.1,
+            "latent_dim"         : 32,
+            "num_classes"        : 2
+        }
+    },
+
+    "data_loader": {
+        "type": "CNCDataLoader",
+        "args": {
+            "data_dir"         : "data/",
+            "machines"         : ["M01"],
+            "operations"       : ["OP02", "OP05", "OP08", "OP11", "OP14"],
+            "window_size"      : 50,
+            "overlap"          : 25,
+            "batch_size"       : 128,
+            "shuffle"          : true,
+            "validation_split" : 0.15,
+            "num_workers"      : 2,
+            "training"         : true
+        }
+    },
+
+    "optimizer": {
+        "type": "AdamW",
+        "args": {
+            "lr"           : 0.0003,
+            "weight_decay" : 1e-4,
+            "betas"        : [0.9, 0.999]
+        }
+    },
+
+    "loss": "combined_anomaly_loss",
+
+    "metrics": [
+        "accuracy",
+        "f1_score",
+        "precision",
+        "recall",
+        "specificity",
+        "false_positive_rate",
+        "false_negative_rate"
+    ],
+
+    "lr_scheduler": {
+        "type": "CosineAnnealingLR",
+        "args": {
+            "T_max"  : 50,
+            "eta_min": 1e-6
+        }
+    },
+
+    "trainer": {
+        "type"        : "AnomalyTrainer",
+        "epochs"      : 50,
+        "loss_alpha"  : 0.6,
+
+        "save_dir"    : "saved/",
+        "save_period" : 5,
+        "verbosity"   : 2,
+
+        "monitor"    : "min val_loss",
+        "early_stop" : 10,
+
+        "tensorboard": true
+    }
+}
