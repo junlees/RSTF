@@ -94,6 +94,26 @@ lower_approach : p < 0.5 - ε  → 확실한 정상 (normal)
 boundary_region: 그 사이       → 최근접 클래스로 분류
 ```
 
+### Temporal Context Correction (`apply_context_correction`)
+
+boundary 샘플을 시간적 이웃(upper/lower 확정 판정)의 **다수결**로 재판정.
+
+```python
+# 각 boundary 인덱스 i 에 대해
+neighborhood = regions[i-k : i] + regions[i+1 : i+k+1]  # i 자신 제외
+n_upper = sum(neighborhood == "upper")
+n_lower = sum(neighborhood == "lower")
+
+n_upper > n_lower           → 이상 (1)
+n_lower >= n_upper (동점)   → 정상 (0)  # 보수적
+둘 다 0 (전부 boundary)     → fallback: P >= 0.5
+```
+
+`require_both_sides=True` 옵션: 왼쪽·오른쪽 **양쪽**에 upper가 있어야 이상 → 더 엄격.
+
+- **권장 설정**: `--context-k 5` (FPR 8.67%↓, FNR 0.43%↓, Accuracy 99.01%↑)
+- `--require-both-sides`는 FPR 개선 효과 감소로 비권장
+
 ---
 
 ## Data
@@ -140,8 +160,20 @@ python train_cnc.py -r saved/models/CNC_TransformerAutoencoder/<run_id>/checkpoi
 ### 평가
 
 ```bash
+# 기본 (RST only)
 python test_cnc.py -r saved/models/CNC_TransformerAutoencoder/<run_id>/model_best.pth
-python test_cnc.py -r <checkpoint> --epsilon 0.05   # ε 조정
+
+# ε 조정
+python test_cnc.py -r <checkpoint> --epsilon 0.05
+
+# Temporal context correction (권장: k=5)
+python test_cnc.py -r <checkpoint> --context-k 5
+
+# 엄격 조건 (양쪽 upper 이웃 필요)
+python test_cnc.py -r <checkpoint> --context-k 5 --require-both-sides
+
+# 시각화 포함
+python test_cnc.py -r <checkpoint> --context-k 5 --plot --boundary-dist
 ```
 
 ### TensorBoard
