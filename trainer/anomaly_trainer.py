@@ -60,6 +60,9 @@ class AnomalyTrainer(BaseTrainer):
         loss_alpha = config["trainer"].get("loss_alpha", 0.6)
         self.combined_loss = CombinedAnomalyLoss(alpha=loss_alpha).to(device)
 
+        # Automatic Mixed Precision
+        self.scaler = torch.amp.GradScaler("cuda")
+
         # Metric trackers — track classification + reconstruction metrics
         metric_names = [m.__name__ for m in self.metric_ftns]
         extra = ["ce_loss", "recon_loss"]
@@ -81,14 +84,17 @@ class AnomalyTrainer(BaseTrainer):
             target = target.to(self.device)  # (B,)
 
             self.optimizer.zero_grad()
-            output = self.model(data)        # (logits, reconstruction)
 
-            loss, ce_loss, recon_loss = self.combined_loss(output, target, data)
-            loss.backward()
+            with torch.amp.autocast("cuda"):
+                output = self.model(data)    # (logits, reconstruction)
+                loss, ce_loss, recon_loss = self.combined_loss(output, target, data)
 
+            self.scaler.scale(loss).backward()
             # Gradient clipping for stable Transformer training
+            self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             step = (epoch - 1) * self.len_epoch + batch_idx
             self.writer.set_step(step)
@@ -135,8 +141,9 @@ class AnomalyTrainer(BaseTrainer):
                 data   = data.to(self.device)
                 target = target.to(self.device)
 
-                output = self.model(data)
-                loss, ce_loss, recon_loss = self.combined_loss(output, target, data)
+                with torch.amp.autocast("cuda"):
+                    output = self.model(data)
+                    loss, ce_loss, recon_loss = self.combined_loss(output, target, data)
 
                 self.writer.set_step(
                     (epoch - 1) * len(self.valid_data_loader) + batch_idx,

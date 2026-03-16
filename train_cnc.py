@@ -23,8 +23,8 @@ from utils import prepare_device
 # ── Reproducibility ───────────────────────────────────────────────────────────
 SEED = 42
 torch.manual_seed(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark     = False
+torch.backends.cudnn.deterministic = False   # benchmark=True와 호환
+torch.backends.cudnn.benchmark     = True    # 입력 크기 고정 시 최적 커널 자동 선택
 np.random.seed(SEED)
 
 
@@ -44,6 +44,7 @@ def main(config):
     model = model.to(device)
     if len(device_ids) > 1:
         model = torch.nn.DataParallel(model, device_ids=device_ids)
+    model = torch.compile(model)   # PyTorch 2.0+ 커널 컴파일 (첫 배치에서 ~30초 소요)
 
     # ── Loss & Metrics ───────────────────────────────────────────────────
     # The AnomalyTrainer constructs CombinedAnomalyLoss internally;

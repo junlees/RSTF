@@ -1,5 +1,5 @@
 {
-    "name": "CNC_TransformerAutoencoder",
+    "name": "CNC_TransformerAutoencoder2",
     "n_gpu": 1,
 
     "arch": {
@@ -22,14 +22,15 @@
         "type": "CNCDataLoader",
         "args": {
             "data_dir"         : "data/",
-            "machines"         : ["M01"],
-            "operations"       : ["OP02", "OP05", "OP08", "OP11", "OP14"],
+            "machines"         : ["M01", "M02", "M03"],
+            "operations"       : null,
             "window_size"      : 50,
             "overlap"          : 25,
-            "batch_size"       : 128,
+            "batch_size"       : 256,
             "shuffle"          : true,
             "validation_split" : 0.15,
-            "num_workers"      : 2,
+            "num_workers"      : 8,
+            "pin_memory"       : true,
             "training"         : true
         }
     },

@@ -69,6 +69,8 @@ class CNCVibrationDataset(Dataset):
 
         self.windows: list[np.ndarray] = []
         self.labels:  list[int]        = []
+        # (name, start_idx, end_idx) — window index range per (machine, op)
+        self.op_segments: list[tuple[str, int, int]] = []
 
         # Discover machines / ops
         if machines is None:
@@ -100,13 +102,19 @@ class CNCVibrationDataset(Dataset):
             for op_dir in op_dirs:
                 if not op_dir.is_dir():
                     continue
-                # good/ → LABEL_OK, bad/ → LABEL_NOK
+                # good/ → LABEL_OK, bad/ → LABEL_NOK — track each subdir separately
                 for subdir, label in [("good", self.LABEL_OK), ("bad", self.LABEL_NOK)]:
                     sub_path = op_dir / subdir
                     if not sub_path.is_dir():
                         continue
+                    seg_start = len(self.windows)
                     for h5_path in sorted(sub_path.glob("*.h5")):
                         self._extract_windows(h5_path, label)
+                    seg_end = len(self.windows)
+                    if seg_end > seg_start:
+                        self.op_segments.append(
+                            (f"{machine}/{op_dir.name}/{subdir}", seg_start, seg_end)
+                        )
 
     def _extract_windows(self, h5_path: Path, label: int):
         try:
@@ -186,6 +194,7 @@ class CNCDataLoader(BaseDataLoader):
         shuffle: bool = True,
         validation_split: float = 0.15,
         num_workers: int = 2,
+        pin_memory: bool = False,
         machines=None,
         operations=None,
         window_size: int = 50,
@@ -209,4 +218,5 @@ class CNCDataLoader(BaseDataLoader):
             shuffle=shuffle,
             validation_split=validation_split,
             num_workers=num_workers,
+            pin_memory=pin_memory,
         )

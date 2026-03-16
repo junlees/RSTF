@@ -180,6 +180,7 @@ def save_reconstruction_plot(
     stride: int,
     save_path: Path,
     max_windows: int = 5000,
+    op_name: str = "",
 ) -> None:
     """
     Save a multi-panel figure showing:
@@ -352,10 +353,10 @@ def save_reconstruction_plot(
     fig.legend(handles=legend_handles, loc="lower center", ncol=3,
                fontsize=8, framealpha=0.8, bbox_to_anchor=(0.5, 0.0))
 
-    fig.suptitle(
-        "CNC Anomaly Detection — Reconstruction Error & RST Boundary Analysis",
-        fontsize=13, y=1.01,
-    )
+    title = "CNC Anomaly Detection — Reconstruction Error & RST Boundary Analysis"
+    if op_name:
+        title = f"[{op_name}]  " + title
+    fig.suptitle(title, fontsize=13, y=1.01)
     plt.tight_layout(rect=[0, 0.03, 1, 1])
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -597,7 +598,7 @@ def evaluate(
 
     # ── Run output directory (timestamped, created once per run) ──────────
     if plot or boundary_dist:
-        _base   = Path(plot_dir) if plot_dir else Path(checkpoint_path).parent
+        _base   = Path(plot_dir) if plot_dir else Path("results/graph") / config["name"]
         run_dir = _base / datetime.now().strftime("%m%d_%H%M%S")
         run_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"  Figures → {run_dir}")
@@ -674,23 +675,30 @@ def evaluate(
         )
     logger.info("=" * 50)
 
-    # ── Visualization ─────────────────────────────────────────────────────
+    # ── Visualization (per-OP individual plots) ───────────────────────────
     if plot:
-        all_inputs = np.concatenate(all_inputs_list, axis=0)  # (N, W, F)
+        all_inputs   = np.concatenate(all_inputs_list, axis=0)   # (N, W, F)
+        op_segments  = data_loader.dataset.op_segments            # [(name, s, e), ...]
 
-        save_path = run_dir / f"recon_rst_eps{epsilon:.3f}.png"
+        # fallback: dataset에 op_segments가 없으면 전체를 단일 세그먼트로 처리
+        if not op_segments:
+            op_segments = [("all", 0, len(all_inputs))]
 
-        save_reconstruction_plot(
-            all_inputs       = all_inputs,
-            all_recon_errors = all_recon_errors,
-            all_probs        = all_probs,
-            all_labels       = all_labels,
-            regions          = regions,
-            epsilon          = epsilon,
-            stride           = stride,
-            save_path        = save_path,
-            max_windows      = plot_max_windows,
-        )
+        for seg_name, seg_s, seg_e in op_segments:
+            safe_name = seg_name.replace("/", "_")
+            save_path = run_dir / f"recon_rst_{safe_name}_eps{epsilon:.3f}.png"
+            save_reconstruction_plot(
+                all_inputs       = all_inputs[seg_s:seg_e],
+                all_recon_errors = all_recon_errors[seg_s:seg_e],
+                all_probs        = all_probs[seg_s:seg_e],
+                all_labels       = all_labels[seg_s:seg_e],
+                regions          = regions[seg_s:seg_e],
+                epsilon          = epsilon,
+                stride           = stride,
+                save_path        = save_path,
+                max_windows      = plot_max_windows,
+                op_name          = seg_name,
+            )
 
     return results
 
