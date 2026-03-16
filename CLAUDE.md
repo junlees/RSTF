@@ -18,8 +18,8 @@ CNC 밀링 머신의 진동 데이터에서 **이상 탐지(Anomaly Detection)**
 ## Repository Structure
 
 ```
-├── base/                        # 템플릿 추상 기반 클래스 (수정 금지)
-│   ├── base_data_loader.py      #   BaseDataLoader
+├── base/                        # 템플릿 추상 기반 클래스
+│   ├── base_data_loader.py      # ★ BaseDataLoader (pin_memory 지원 추가)
 │   ├── base_model.py            #   BaseModel (nn.Module 상속)
 │   └── base_trainer.py          #   BaseTrainer (체크포인트/로깅 담당)
 │
@@ -35,7 +35,7 @@ CNC 밀링 머신의 진동 데이터에서 **이상 탐지(Anomaly Detection)**
 │   └── data_loaders.py          #   원본 MnistDataLoader (유지)
 │
 ├── trainer/
-│   ├── anomaly_trainer.py       # ★ AnomalyTrainer (combined loss 처리)
+│   ├── anomaly_trainer.py       # ★ AnomalyTrainer (combined loss + AMP)
 │   ├── trainer.py               #   원본 Trainer (유지)
 │   └── __init__.py
 │
@@ -43,7 +43,7 @@ CNC 밀링 머신의 진동 데이터에서 **이상 탐지(Anomaly Detection)**
 ├── utils/                       # MetricTracker, prepare_device 등 (수정 금지)
 │
 ├── config_cnc_transformer.json  # ★ CNC 실험용 설정 파일
-├── train_cnc.py                 # ★ CNC 학습 진입점
+├── train_cnc.py                 # ★ CNC 학습 진입점 (torch.compile 포함)
 ├── test_cnc.py                  # ★ CNC 평가 + Rough Set 후처리
 ├── train.py                     #   원본 MNIST 학습 스크립트 (유지)
 └── parse_config.py              # ConfigParser (수정 금지)
@@ -135,10 +135,21 @@ n_lower >= n_upper (동점)   → 정상 (0)  # 보수적
 git clone https://github.com/boschresearch/CNC_Machining data/
 ```
 
-### CSV 파일 명명 규칙
+### HDF5 파일 구조
 
-- `*_OK.csv`  → label = 1 (정상)
-- `*_NOK.csv` → label = 0 (이상)
+```
+data/
+  M01/
+    OP00/ … OP14/
+      good/  *.h5   → label = 1 (정상, OK)
+      bad/   *.h5   → label = 0 (이상, NOK)
+```
+
+- `machines=null` → M01/M02/M03 전체 자동 탐색
+- `operations=null` → OP00~OP14 전체 자동 탐색
+- 각 `.h5` 파일: `vibration_data` key → `(N, 3)` float array (~134초 @ 2kHz)
+- `CNCVibrationDataset.op_segments` — `[(name, start_idx, end_idx), ...]`
+  `(machine/op/good|bad)` 단위로 윈도우 범위를 추적 → OP별 시각화에 사용
 
 ---
 
@@ -147,15 +158,17 @@ git clone https://github.com/boschresearch/CNC_Machining data/
 ### 학습
 
 ```bash
-# 기본 실행 (M01, OP02+OP05+OP08+OP11+OP14)
+# 기본 실행 (M01/M02/M03 전체, OP00~OP14)
 python train_cnc.py -c config_cnc_transformer.json
 
 # 하이퍼파라미터 오버라이드
-python train_cnc.py -c config_cnc_transformer.json --lr 0.0001 --bs 64 --alpha 0.7
+python train_cnc.py -c config_cnc_transformer.json --lr 0.0001 --bs 256 --alpha 0.7
 
 # 체크포인트에서 재개
 python train_cnc.py -r saved/models/CNC_TransformerAutoencoder/<run_id>/checkpoint-epoch10.pth
 ```
+
+> **첫 실행 시**: `torch.compile` 컴파일로 첫 배치에서 약 30초 소요 — 이후 정상 속도.
 
 ### 평가
 
@@ -172,9 +185,12 @@ python test_cnc.py -r <checkpoint> --context-k 5
 # 엄격 조건 (양쪽 upper 이웃 필요)
 python test_cnc.py -r <checkpoint> --context-k 5 --require-both-sides
 
-# 시각화 포함
+# 시각화 포함 (OP별 개별 그래프 저장)
 python test_cnc.py -r <checkpoint> --context-k 5 --plot --boundary-dist
 ```
+
+> **시각화 저장 경로**: `results/graph/{config.name}/{MMDD_HHMMSS}/`
+> OP×good/bad 단위로 개별 PNG 생성 — `recon_rst_{machine}_{op}_{good|bad}_eps{ε}.png`
 
 ### TensorBoard
 
@@ -269,6 +285,17 @@ def my_metric(output, target):
 | alpha=0.6 (CE > Recon) | 분류 정확도 우선, 재구성은 보조 역할 |
 | window_size=50, overlap=25 | 논문 RoughLSTM과 동일 설정 유지 |
 
+### GPU 학습 최적화
+
+| 설정 | 값 | 효과 |
+|---|---|---|
+| AMP (`torch.amp.autocast`) | train/valid 모두 적용 | Tensor Core 활용, fp16 연산 가속 |
+| `GradScaler` | AMP와 함께 사용 | fp16 언더플로 방지, `unscale_` 후 grad clip |
+| `torch.compile(model)` | `train_cnc.py` | PyTorch 2.0+ 커널 컴파일, 첫 배치 ~30초 소요 |
+| `cudnn.benchmark=True` | `train_cnc.py` | 고정 입력 크기 최적 CUDA 커널 자동 선택 |
+| `batch_size` | 256 (config) | GPU 활용률 증가 |
+| `num_workers=8`, `pin_memory=True` | config | CPU↔GPU 데이터 전송 병목 제거 |
+
 ---
 
 ## Dependencies
@@ -277,7 +304,10 @@ def my_metric(output, target):
 torch >= 2.0
 numpy
 pandas
+h5py           # Bosch CNC HDF5 파일 로드
 scikit-learn   # roc_auc_score (test_cnc.py)
+scipy          # gaussian_kde (boundary dist plot)
+matplotlib
 tqdm
 tensorboard >= 1.14
 ```
